@@ -731,9 +731,9 @@ async function uploadFile(file) {
     addMessage("bot", data.reply);
     parsePanel(data.reply, file.name);
 
-  } catch {
+  } catch (err) {
     removeThinking();
-    addMessage("bot", "Could not connect to the server. Make sure claimsense_server.py is running.");
+    addMessage("bot", `Upload failed: ${err.message || err}`);
   }
 
   setDisabled(false);
@@ -759,9 +759,9 @@ async function sendMessage() {
     removeThinking();
     addMessage("bot", data.reply);
     if (docLoaded) parsePanel(data.reply, null);
-  } catch {
+  } catch (err) {
     removeThinking();
-    addMessage("bot", "Something went wrong. Please try again.");
+    addMessage("bot", `Chat error: ${err.message || err}`);
   }
 
   setDisabled(false);

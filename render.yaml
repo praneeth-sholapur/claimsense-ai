@@ -3,7 +3,7 @@ services:
     name: claimsense-ai
     env: python
     buildCommand: apt-get install -y poppler-utils && pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
