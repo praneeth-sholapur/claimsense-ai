@@ -1,0 +1,11 @@
+flask
+flask-cors
+anthropic
+google-genai
+pinecone
+google-cloud-vision
+pdf2image
+python-docx
+PyPDF2
+python-dotenv
+gunicorn
