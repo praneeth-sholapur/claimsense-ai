@@ -143,18 +143,35 @@ def ocr_image_bytes(image_bytes):
     return texts[0].description if texts else ""
 
 
+def _pdf_has_text_layer(file_bytes):
+    """Probe only the first page to decide if the PDF has a real text layer.
+    Avoids iterating all pages on scanned PDFs, which OOMs on low-memory hosts."""
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        if not reader.pages:
+            return False
+        t = reader.pages[0].extract_text() or ""
+        return len(t.strip()) >= 50
+    except Exception:
+        return False
+
+
 def extract_from_pdf_text(file_bytes):
     reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text = ""
     for i, page in enumerate(reader.pages):
-        t = page.extract_text()
-        if t:
-            text += f"\n[Page {i+1}]\n{t}"
+        try:
+            t = page.extract_text()
+            if t:
+                text += f"\n[Page {i+1}]\n{t}"
+        except Exception:
+            pass
     return text, len(reader.pages)
 
 
 def extract_from_pdf_ocr(file_bytes):
-    images = convert_from_bytes(file_bytes, poppler_path=POPPLER_PATH)
+    # 150 DPI keeps Vision accuracy high while halving memory vs the 200 DPI default
+    images = convert_from_bytes(file_bytes, poppler_path=POPPLER_PATH, dpi=150)
     text = ""
     for i, img in enumerate(images):
         buf = io.BytesIO()
@@ -187,11 +204,11 @@ def extract_text(filename, file_bytes):
     elif name.endswith((".jpg", ".jpeg", ".png")):
         return extract_from_image(file_bytes)
     elif name.endswith(".pdf"):
-        text, pages = extract_from_pdf_text(file_bytes)
-        if len(text.strip()) < 100:
-            log.info("PDF text too short (%d chars), falling back to OCR", len(text.strip()))
-            return extract_from_pdf_ocr(file_bytes)
-        return text, pages
+        if _pdf_has_text_layer(file_bytes):
+            log.info("PDF has text layer, extracting directly")
+            return extract_from_pdf_text(file_bytes)
+        log.info("PDF has no text layer (scanned), using OCR")
+        return extract_from_pdf_ocr(file_bytes)
     return "", 0
 
 # ---------------------------------------------------------------------------
