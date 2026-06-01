@@ -665,7 +665,11 @@ body {
 </div>
 
 <script>
-const API = "http://localhost:5001";
+// In production the HTML is served by Flask itself, so API calls are same-origin (empty string).
+// Locally Flask runs on port 5001.
+const API = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+  ? "http://localhost:5001"
+  : "";
 let docLoaded = false;
 
 // Clear server state whenever this page loads so stale history never leaks between sessions

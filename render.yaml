@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: claimsense-ai
+    env: python
+    buildCommand: apt-get install -y poppler-utils && pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: GOOGLE_VISION_KEY
+        sync: false

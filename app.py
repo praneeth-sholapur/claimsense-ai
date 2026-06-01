@@ -1,9 +1,10 @@
-﻿from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import anthropic
 import google.genai as genai
-from pinecone import Pinecone
 from google.cloud import vision
+from google.oauth2 import service_account
+from pinecone import Pinecone
 from pdf2image import convert_from_bytes
 from docx import Document
 import PyPDF2
@@ -14,18 +15,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\shola\vision-key.json"
-POPPLER_PATH = r"C:\Users\shola\poppler\poppler-26.02.0\Library\bin"
-
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")  # full service account JSON as a string
+
+# Poppler: set POPPLER_PATH env var locally on Windows; leave unset on Linux (Render)
+POPPLER_PATH = os.getenv("POPPLER_PATH") or None
+
+# Build Vision client from JSON env var so no key file is needed on the server
+_vision_info = json.loads(GOOGLE_VISION_KEY)
+_vision_creds = service_account.Credentials.from_service_account_info(
+    _vision_info,
+    scopes=["https://www.googleapis.com/auth/cloud-vision"]
+)
+vision_client = vision.ImageAnnotatorClient(credentials=_vision_creds)
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index("knowledge-assistant")
-vision_client = vision.ImageAnnotatorClient()
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
 CORS(app)
@@ -76,21 +87,23 @@ conversation_history = []
 document_text = ""
 document_loaded = False
 
+
 def ocr_image_bytes(image_bytes):
     image = vision.Image(content=image_bytes)
     response = vision_client.document_text_detection(image=image)
     texts = response.text_annotations
     return texts[0].description if texts else ""
 
+
 def extract_from_pdf_text(file_bytes):
     reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text = ""
-    pages = len(reader.pages)
     for i, page in enumerate(reader.pages):
         t = page.extract_text()
         if t:
             text += f"\n[Page {i+1}]\n{t}"
-    return text, pages
+    return text, len(reader.pages)
+
 
 def extract_from_pdf_ocr(file_bytes):
     images = convert_from_bytes(file_bytes, poppler_path=POPPLER_PATH)
@@ -98,20 +111,23 @@ def extract_from_pdf_ocr(file_bytes):
     for i, img in enumerate(images):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        ocr_text = ocr_image_bytes(buf.getvalue())
-        text += f"\n[Page {i+1}]\n{ocr_text}"
+        text += f"\n[Page {i+1}]\n{ocr_image_bytes(buf.getvalue())}"
     return text, len(images)
+
 
 def extract_from_image(file_bytes):
     return ocr_image_bytes(file_bytes), 1
+
 
 def extract_from_docx(file_bytes):
     doc = Document(io.BytesIO(file_bytes))
     text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
     return text, 1
 
+
 def extract_from_txt(file_bytes):
     return file_bytes.decode("utf-8", errors="ignore"), 1
+
 
 def extract_text(filename, file_bytes):
     name = filename.lower()
@@ -127,6 +143,7 @@ def extract_text(filename, file_bytes):
             return extract_from_pdf_ocr(file_bytes)
         return text, pages
     return "", 0
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -154,10 +171,7 @@ Here is the full document content:
 
 Please analyze this document now. Provide the structured ClaimSense report with claim type, risk level, extracted data, flags, and recommendation. Then ask if they have any questions."""
 
-    conversation_history.append({
-        "role": "user",
-        "content": analysis_prompt
-    })
+    conversation_history.append({"role": "user", "content": analysis_prompt})
 
     response = claude.messages.create(
         model="claude-sonnet-4-5",
@@ -167,38 +181,21 @@ Please analyze this document now. Provide the structured ClaimSense report with 
     )
 
     assistant_reply = response.content[0].text
+    conversation_history.append({"role": "assistant", "content": assistant_reply})
 
-    conversation_history.append({
-        "role": "assistant",
-        "content": assistant_reply
-    })
+    return jsonify({"reply": assistant_reply, "filename": file.filename, "pages": pages})
 
-    return jsonify({
-        "reply": assistant_reply,
-        "filename": file.filename,
-        "pages": pages
-    })
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    global conversation_history, document_text, document_loaded
+    global conversation_history
 
     data = request.json
     message = data.get("message", "").strip()
-
     if not message:
         return jsonify({"error": "No message provided"}), 400
 
-    if document_loaded and document_text:
-        conversation_history.append({
-            "role": "user",
-            "content": message
-        })
-    else:
-        conversation_history.append({
-            "role": "user",
-            "content": message
-        })
+    conversation_history.append({"role": "user", "content": message})
 
     response = claude.messages.create(
         model="claude-sonnet-4-5",
@@ -208,13 +205,10 @@ def chat():
     )
 
     assistant_reply = response.content[0].text
-
-    conversation_history.append({
-        "role": "assistant",
-        "content": assistant_reply
-    })
+    conversation_history.append({"role": "assistant", "content": assistant_reply})
 
     return jsonify({"reply": assistant_reply})
+
 
 @app.route("/reset", methods=["POST"])
 def reset():
@@ -224,9 +218,12 @@ def reset():
     document_loaded = False
     return jsonify({"status": "reset"})
 
+
 @app.route("/")
 def serve():
-    return send_from_directory(r"C:\Users\shola", "claimsense.html")
+    return send_from_directory(HERE, "claimsense.html")
+
 
 if __name__ == "__main__":
-    app.run(port=5001, debug=False)
+    port = int(os.getenv("PORT", 5001))
+    app.run(port=port, debug=False)
