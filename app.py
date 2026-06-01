@@ -2,6 +2,7 @@ import logging
 import os
 import io
 import json
+import shutil
 import traceback
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -24,7 +25,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
-POPPLER_PATH = os.getenv("POPPLER_PATH") or None
+# On Linux, find poppler from PATH. On Windows, fall back to the POPPLER_PATH env var.
+_pdftoppm = shutil.which("pdftoppm")
+POPPLER_PATH = os.path.dirname(_pdftoppm) if _pdftoppm else (os.getenv("POPPLER_PATH") or None)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -203,6 +206,7 @@ def health():
         "pinecone": index is not None,
         "gemini": gemini_client is not None,
         "poppler_path": POPPLER_PATH,
+        "poppler_available": POPPLER_PATH is not None,
     })
 
 
