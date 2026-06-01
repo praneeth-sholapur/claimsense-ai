@@ -714,6 +714,13 @@ async function uploadFile(file) {
 
   try {
     const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
+    if (!res.ok) {
+      const body = await res.text();
+      removeThinking();
+      addMessage("bot", `Server error ${res.status}: ${body.slice(0, 300)}`);
+      setDisabled(false);
+      return;
+    }
     const data = await res.json();
     removeThinking();
 

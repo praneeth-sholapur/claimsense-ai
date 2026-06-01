@@ -1,3 +1,8 @@
+import logging
+import os
+import io
+import json
+import traceback
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import anthropic
@@ -8,38 +13,77 @@ from pinecone import Pinecone
 from pdf2image import convert_from_bytes
 from docx import Document
 import PyPDF2
-import os
-import io
-import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")  # full service account JSON as a string
-
-# Poppler: set POPPLER_PATH env var locally on Windows; leave unset on Linux (Render)
+GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
-
-# Build Vision client from JSON env var so no key file is needed on the server
-_vision_info = json.loads(GOOGLE_VISION_KEY)
-_vision_creds = service_account.Credentials.from_service_account_info(
-    _vision_info,
-    scopes=["https://www.googleapis.com/auth/cloud-vision"]
-)
-vision_client = vision.ImageAnnotatorClient(credentials=_vision_creds)
-
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index("knowledge-assistant")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
 CORS(app)
+
+# ---------------------------------------------------------------------------
+# External client initialisation — log clearly so Render logs show any failure
+# ---------------------------------------------------------------------------
+
+def _init_vision():
+    if not GOOGLE_VISION_KEY:
+        log.error("GOOGLE_VISION_KEY env var is not set")
+        return None
+    try:
+        info = json.loads(GOOGLE_VISION_KEY)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-vision"]
+        )
+        client = vision.ImageAnnotatorClient(credentials=creds)
+        log.info("Vision client initialised OK")
+        return client
+    except Exception:
+        log.error("Failed to initialise Vision client:\n%s", traceback.format_exc())
+        return None
+
+
+try:
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    log.info("Anthropic client initialised OK")
+except Exception:
+    log.error("Failed to initialise Anthropic client:\n%s", traceback.format_exc())
+    claude = None
+
+try:
+    gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
+    log.info("Gemini client initialised OK")
+except Exception:
+    log.error("Failed to initialise Gemini client:\n%s", traceback.format_exc())
+    gemini_client = None
+
+try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    index = pc.Index("knowledge-assistant")
+    log.info("Pinecone client initialised OK")
+except Exception:
+    log.error("Failed to initialise Pinecone client:\n%s", traceback.format_exc())
+    pc = None
+    index = None
+
+vision_client = _init_vision()
+
+# ---------------------------------------------------------------------------
+# Conversation state
+# ---------------------------------------------------------------------------
+
+conversation_history = []
+document_text = ""
+document_loaded = False
 
 SYSTEM_PROMPT = """You are ClaimSense, an AI insurance claims assistant built to analyze insurance documents.
 
@@ -83,12 +127,13 @@ RECOMMENDATION:
 
 After the analysis, ask if they have any questions about the document."""
 
-conversation_history = []
-document_text = ""
-document_loaded = False
-
+# ---------------------------------------------------------------------------
+# OCR / extraction helpers
+# ---------------------------------------------------------------------------
 
 def ocr_image_bytes(image_bytes):
+    if not vision_client:
+        raise RuntimeError("Vision client is not available — check GOOGLE_VISION_KEY")
     image = vision.Image(content=image_bytes)
     response = vision_client.document_text_detection(image=image)
     texts = response.text_annotations
@@ -131,6 +176,7 @@ def extract_from_txt(file_bytes):
 
 def extract_text(filename, file_bytes):
     name = filename.lower()
+    log.info("Extracting text from: %s", name)
     if name.endswith(".txt"):
         return extract_from_txt(file_bytes)
     elif name.endswith(".docx"):
@@ -140,74 +186,108 @@ def extract_text(filename, file_bytes):
     elif name.endswith(".pdf"):
         text, pages = extract_from_pdf_text(file_bytes)
         if len(text.strip()) < 100:
+            log.info("PDF text too short (%d chars), falling back to OCR", len(text.strip()))
             return extract_from_pdf_ocr(file_bytes)
         return text, pages
     return "", 0
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "claude": claude is not None,
+        "vision": vision_client is not None,
+        "pinecone": index is not None,
+        "gemini": gemini_client is not None,
+        "poppler_path": POPPLER_PATH,
+    })
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
     global document_text, document_loaded, conversation_history
+    try:
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file provided"}), 400
 
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "No file provided"}), 400
+        log.info("Upload received: %s", file.filename)
+        file_bytes = file.read()
 
-    file_bytes = file.read()
-    text, pages = extract_text(file.filename, file_bytes)
+        try:
+            text, pages = extract_text(file.filename, file_bytes)
+        except Exception:
+            msg = traceback.format_exc()
+            log.error("Text extraction failed:\n%s", msg)
+            return jsonify({"error": f"Text extraction failed: {msg}"}), 500
 
-    if not text.strip():
-        return jsonify({"error": "Could not extract text from this file"}), 400
+        if not text.strip():
+            return jsonify({"error": "Could not extract text from this file"}), 400
 
-    document_text = text
-    document_loaded = True
-    conversation_history = []
+        document_text = text
+        document_loaded = True
+        conversation_history = []
 
-    analysis_prompt = f"""A new insurance document has been uploaded: {file.filename}
+        analysis_prompt = (
+            f"A new insurance document has been uploaded: {file.filename}\n\n"
+            f"Here is the full document content:\n\n{document_text}\n\n"
+            "Please analyze this document now. Provide the structured ClaimSense report "
+            "with claim type, risk level, extracted data, flags, and recommendation. "
+            "Then ask if they have any questions."
+        )
+        conversation_history.append({"role": "user", "content": analysis_prompt})
 
-Here is the full document content:
+        try:
+            response = claude.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=conversation_history,
+            )
+        except Exception:
+            msg = traceback.format_exc()
+            log.error("Claude API call failed:\n%s", msg)
+            return jsonify({"error": f"Claude API error: {msg}"}), 500
 
-{document_text}
+        assistant_reply = response.content[0].text
+        conversation_history.append({"role": "assistant", "content": assistant_reply})
+        log.info("Upload complete, returning analysis")
+        return jsonify({"reply": assistant_reply, "filename": file.filename, "pages": pages})
 
-Please analyze this document now. Provide the structured ClaimSense report with claim type, risk level, extracted data, flags, and recommendation. Then ask if they have any questions."""
-
-    conversation_history.append({"role": "user", "content": analysis_prompt})
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=conversation_history
-    )
-
-    assistant_reply = response.content[0].text
-    conversation_history.append({"role": "assistant", "content": assistant_reply})
-
-    return jsonify({"reply": assistant_reply, "filename": file.filename, "pages": pages})
+    except Exception:
+        msg = traceback.format_exc()
+        log.error("Unhandled error in /upload:\n%s", msg)
+        return jsonify({"error": f"Unexpected server error: {msg}"}), 500
 
 
 @app.route("/chat", methods=["POST"])
 def chat():
     global conversation_history
+    try:
+        data = request.json
+        message = data.get("message", "").strip()
+        if not message:
+            return jsonify({"error": "No message provided"}), 400
 
-    data = request.json
-    message = data.get("message", "").strip()
-    if not message:
-        return jsonify({"error": "No message provided"}), 400
+        conversation_history.append({"role": "user", "content": message})
 
-    conversation_history.append({"role": "user", "content": message})
+        response = claude.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=conversation_history,
+        )
+        assistant_reply = response.content[0].text
+        conversation_history.append({"role": "assistant", "content": assistant_reply})
+        return jsonify({"reply": assistant_reply})
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        messages=conversation_history
-    )
-
-    assistant_reply = response.content[0].text
-    conversation_history.append({"role": "assistant", "content": assistant_reply})
-
-    return jsonify({"reply": assistant_reply})
+    except Exception:
+        msg = traceback.format_exc()
+        log.error("Unhandled error in /chat:\n%s", msg)
+        return jsonify({"error": f"Unexpected server error: {msg}"}), 500
 
 
 @app.route("/reset", methods=["POST"])
